@@ -94,72 +94,86 @@ const gamma0 = (x: number): number => (rotr(7, x) ^ rotr(18, x) ^ (x >>> 3)) >>>
 const gamma1 = (x: number): number => (rotr(17, x) ^ rotr(19, x) ^ (x >>> 10)) >>> 0
 
 const W = new Uint32Array(64)
+const IV = new Uint32Array([0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a, 0x510e527f, 0x9b05688c, 0x1f83d9ab, 0x5be0cd19])
+
+/** One SHA-256 compression: folds the 64-byte block at `offset` into `state`. */
+function compress(state: Uint32Array, view: DataView, offset: number): void {
+  for (let i = 0; i < 16; i++) W[i] = view.getUint32(offset + i * 4)
+  for (let i = 16; i < 64; i++) W[i] = (gamma1(W[i - 2]) + W[i - 7] + gamma0(W[i - 15]) + W[i - 16]) >>> 0
+  let a = state[0], b = state[1], c = state[2], d = state[3], e = state[4], f = state[5], g = state[6], h = state[7]
+  for (let i = 0; i < 64; i++) {
+    const t1 = (h + sigma1(e) + ch(e, f, g) + K[i] + W[i]) >>> 0
+    const t2 = (sigma0(a) + maj(a, b, c)) >>> 0
+    h = g; g = f; f = e
+    e = (d + t1) >>> 0
+    d = c; c = b; b = a
+    a = (t1 + t2) >>> 0
+  }
+  state[0] = (state[0] + a) >>> 0
+  state[1] = (state[1] + b) >>> 0
+  state[2] = (state[2] + c) >>> 0
+  state[3] = (state[3] + d) >>> 0
+  state[4] = (state[4] + e) >>> 0
+  state[5] = (state[5] + f) >>> 0
+  state[6] = (state[6] + g) >>> 0
+  state[7] = (state[7] + h) >>> 0
+}
+
+/** The padded message for `data` as the tail of a message `consumed` bytes long already. */
+function padded(data: Uint8Array, consumed: number): Uint8Array {
+  const msgLen = data.length
+  const bitLen = BigInt(consumed + msgLen) * 8n
+  const padLen = 64 - ((msgLen + 9) % 64)
+  const totalLen = msgLen + 1 + (padLen === 64 ? 0 : padLen) + 8
+  const out = new Uint8Array(totalLen)
+  out.set(data)
+  out[msgLen] = 0x80
+  const view = new DataView(out.buffer)
+  view.setUint32(totalLen - 8, Number(bitLen >> 32n))
+  view.setUint32(totalLen - 4, Number(bitLen & 0xffffffffn))
+  return out
+}
+
+function digest(state: Uint32Array): Uint8Array {
+  const result = new Uint8Array(32)
+  const rv = new DataView(result.buffer)
+  for (let i = 0; i < 8; i++) rv.setUint32(i * 4, state[i])
+  return result
+}
 
 /**
  * Synchronous SHA-256. Returns 32 bytes.
  */
 export function sha256(data: Uint8Array): Uint8Array {
-  const msgLen = data.length
-  const bitLen = BigInt(msgLen) * 8n
-  const padLen = 64 - ((msgLen + 9) % 64)
-  const totalLen = msgLen + 1 + (padLen === 64 ? 0 : padLen) + 8
-  const padded = new Uint8Array(totalLen)
-  padded.set(data)
-  padded[msgLen] = 0x80
+  const state = new Uint32Array(IV)
+  const msg = padded(data, 0)
+  const view = new DataView(msg.buffer)
+  for (let offset = 0; offset < msg.length; offset += 64) compress(state, view, offset)
+  return digest(state)
+}
 
-  const view = new DataView(padded.buffer)
-  view.setUint32(totalLen - 8, Number(bitLen >> 32n))
-  view.setUint32(totalLen - 4, Number(bitLen & 0xffffffffn))
+/**
+ * The compression state after exactly one 64-byte block, to hash many
+ * messages that share that block as their prefix (spec 6.5, the midstate
+ * optimization): resume from it with sha256FromMidstate for each tail.
+ */
+export function sha256Midstate(block: Uint8Array): Uint32Array {
+  if (block.length !== 64) throw new Error('a midstate is taken over exactly one 64-byte block')
+  const state = new Uint32Array(IV)
+  compress(state, new DataView(block.buffer, block.byteOffset, 64), 0)
+  return state
+}
 
-  let h0 = 0x6a09e667 >>> 0
-  let h1 = 0xbb67ae85 >>> 0
-  let h2 = 0x3c6ef372 >>> 0
-  let h3 = 0xa54ff53a >>> 0
-  let h4 = 0x510e527f >>> 0
-  let h5 = 0x9b05688c >>> 0
-  let h6 = 0x1f83d9ab >>> 0
-  let h7 = 0x5be0cd19 >>> 0
-
-  for (let offset = 0; offset < totalLen; offset += 64) {
-    for (let i = 0; i < 16; i++) {
-      W[i] = view.getUint32(offset + i * 4)
-    }
-    for (let i = 16; i < 64; i++) {
-      W[i] = (gamma1(W[i - 2]) + W[i - 7] + gamma0(W[i - 15]) + W[i - 16]) >>> 0
-    }
-
-    let a = h0, b = h1, c = h2, d = h3, e = h4, f = h5, g = h6, h = h7
-
-    for (let i = 0; i < 64; i++) {
-      const t1 = (h + sigma1(e) + ch(e, f, g) + K[i] + W[i]) >>> 0
-      const t2 = (sigma0(a) + maj(a, b, c)) >>> 0
-      h = g; g = f; f = e
-      e = (d + t1) >>> 0
-      d = c; c = b; b = a
-      a = (t1 + t2) >>> 0
-    }
-
-    h0 = (h0 + a) >>> 0
-    h1 = (h1 + b) >>> 0
-    h2 = (h2 + c) >>> 0
-    h3 = (h3 + d) >>> 0
-    h4 = (h4 + e) >>> 0
-    h5 = (h5 + f) >>> 0
-    h6 = (h6 + g) >>> 0
-    h7 = (h7 + h) >>> 0
-  }
-
-  const result = new Uint8Array(32)
-  const rv = new DataView(result.buffer)
-  rv.setUint32(0, h0)
-  rv.setUint32(4, h1)
-  rv.setUint32(8, h2)
-  rv.setUint32(12, h3)
-  rv.setUint32(16, h4)
-  rv.setUint32(20, h5)
-  rv.setUint32(24, h6)
-  rv.setUint32(28, h7)
-  return result
+/**
+ * SHA-256 of (the 64-byte block behind `midstate` || tail), for a tail of at
+ * most 55 bytes so that one more compression finishes the hash.
+ */
+export function sha256FromMidstate(midstate: Uint32Array, tail: Uint8Array): Uint8Array {
+  if (tail.length > 55) throw new Error('a midstate tail must fit one block with its padding (55 bytes)')
+  const state = new Uint32Array(midstate)
+  const msg = padded(tail, 64)
+  compress(state, new DataView(msg.buffer), 0)
+  return digest(state)
 }
 
 export function sha256Hex(data: Uint8Array): string {
