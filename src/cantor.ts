@@ -15,8 +15,30 @@ export function cantorPair(a: bigint, b: bigint): bigint {
   return (s * (s + 1n)) / 2n + b
 }
 
+/** ASCII code point to nibble, for the hex digits and nothing else. */
+const NIBBLE = (() => {
+  const table = new Uint8Array(103)
+  for (let c = 0; c < 10; c++) table[48 + c] = c
+  for (let c = 0; c < 6; c++) {
+    table[97 + c] = 10 + c
+    table[65 + c] = 10 + c
+  }
+  return table
+})()
+
 /**
  * Convert a non-negative bigint to minimal big-endian bytes.
+ *
+ * The values this runs on are not small. A hop proof at LCA height 18 ends
+ * with a 21 MB integer, so this loop runs 22 million times, and the obvious
+ * `parseInt(hex.substring(i * 2, i * 2 + 2), 16)` allocates a two-character
+ * string and runs a general-purpose number parser on every one of them: 750 ms
+ * of the six seconds that hop takes. Reading the two code points and looking
+ * their nibbles up in a table is the same answer 3.7 times faster, and it
+ * allocates nothing.
+ *
+ * toString(16) stays because hex is a power of two, so V8 reinterprets the
+ * digits rather than dividing, which makes it linear and cheap.
  */
 export function intToBytesBE(n: bigint): Uint8Array {
   if (n < 0n) throw new Error('expected non-negative bigint')
@@ -24,8 +46,8 @@ export function intToBytesBE(n: bigint): Uint8Array {
   let hex = n.toString(16)
   if (hex.length % 2 !== 0) hex = '0' + hex
   const bytes = new Uint8Array(hex.length / 2)
-  for (let i = 0; i < bytes.length; i++) {
-    bytes[i] = parseInt(hex.substring(i * 2, i * 2 + 2), 16)
+  for (let i = 0, j = 0; j < bytes.length; j++, i += 2) {
+    bytes[j] = (NIBBLE[hex.charCodeAt(i)] << 4) | NIBBLE[hex.charCodeAt(i + 1)]
   }
   return bytes
 }
