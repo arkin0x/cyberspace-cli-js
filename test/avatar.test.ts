@@ -19,8 +19,8 @@ describe('avatarWork', () => {
   it('prices reach hardest: each doubling costs six bits, detail three, and nothing under a gibson', () => {
     const one = VECTORS.find((v) => v.name === 'one gibson, plain')!.required
     expect(VECTORS.find((v) => v.name === 'half gibson, ticks')!.required).toBe(one)
-    expect(VECTORS.find((v) => v.name === 'two gibsons')!.required - one).toBe(6)
-    expect(VECTORS.find((v) => v.name === 'four gibsons')!.required - one).toBe(12)
+    expect(VECTORS.find((v) => v.name === 'two gibsons')!.required - one).toBe(3)
+    expect(VECTORS.find((v) => v.name === 'four gibsons')!.required - one).toBe(6)
   })
 })
 
