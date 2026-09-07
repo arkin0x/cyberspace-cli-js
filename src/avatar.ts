@@ -21,7 +21,7 @@
 /** Bits every avatar owes, whatever its shape. */
 export const AVATAR_FLOOR_BITS = 16
 /** Bits per doubling of reach. */
-export const AVATAR_SIZE_BITS = 3
+export const AVATAR_SIZE_BITS = 2
 /** Bits per doubling of vertices plus faces beyond DETAIL_FREE. */
 export const AVATAR_DETAIL_BITS = 3
 /** Vertices plus faces that cost nothing. */
