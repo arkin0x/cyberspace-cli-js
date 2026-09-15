@@ -1,5 +1,5 @@
 /**
- * avatar.ts - the work an avatar owes (kind 10333).
+ * avatar.ts - the work an avatar owes (kind 11333).
  *
  * An avatar is drawn on every screen near its owner whether they like it or
  * not, so its size and its detail are paid for in proof of work on the event
@@ -37,7 +37,7 @@ export const AVATAR_DETAIL_FREE = 32
  * bags and movement events. 33331 now belongs to a standalone SNO object
  * (DECK-0004), where a `d` the author chooses is a real key.
  */
-export const AVATAR_KIND = 10333
+export const AVATAR_KIND = 11333
 /** Ticks in a model unit, as the shard payload divides them. */
 const TICKS_PER_UNIT = 120
 
