@@ -1,5 +1,5 @@
 /**
- * avatar.ts - the work an avatar owes (kind 33331).
+ * avatar.ts - the work an avatar owes (kind 11333).
  *
  * An avatar is drawn on every screen near its owner whether they like it or
  * not, so its size and its detail are paid for in proof of work on the event
@@ -26,7 +26,18 @@ export const AVATAR_SIZE_BITS = 2
 export const AVATAR_DETAIL_BITS = 3
 /** Vertices plus faces that cost nothing. */
 export const AVATAR_DETAIL_FREE = 32
-export const AVATAR_KIND = 33331
+/**
+ * Replaceable: one avatar per pubkey, the newest wins, no `d` tag.
+ *
+ * This was 33331, addressable with a `d` fixed at "avatar", which is
+ * emulating replaceable semantics with the wrong tool: a constant `d` asks
+ * every reader to trust a convention where the relay could enforce the rule.
+ * Spec 8.10. The break was clean because nothing was published: a query for
+ * 33331 across four relays returned nothing while the same query returned
+ * bags and movement events. 33331 now belongs to a standalone SNO object
+ * (DECK-0004), where a `d` the author chooses is a real key.
+ */
+export const AVATAR_KIND = 11333
 /** Ticks in a model unit, as the shard payload divides them. */
 const TICKS_PER_UNIT = 120
 
