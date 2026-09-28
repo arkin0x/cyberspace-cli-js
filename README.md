@@ -14,6 +14,8 @@ Zero runtime dependencies. Runs identically in Node, browsers and web workers, w
 | `terrain.ts` | Deterministic terrain-derived temporal height K, in [0, 16] |
 | `sector.ts` | Sector partitioning (default 2^30 axis-units per side) |
 | `location_encryption.ts` | Region key derivation from Cantor roots |
+| `sidestep.ts` | Merkle sidesteps, version 3: seeded trees, the re-roll price and its `mn` nonce, openings, Level 1 verification |
+| `grandfathered_v2_sidesteps.ts` | Generated: the version 2 sidesteps exempt under spec 6.16, by event id |
 
 ## Usage
 
@@ -61,4 +63,16 @@ npm install
 npm test        # golden vectors
 npm run typecheck
 npm run build   # emits dist/ with declarations
+```
+
+Two files are generated from the spec repository, read at a git ref (never the
+working tree) with the commit recorded. Fetch the clone first; both default to
+`../cyberspace` at `origin/master`.
+
+```sh
+# The exempt version 2 sidestep ids (spec 6.16), when the list grows.
+npm run grandfathered -- [path to cyberspace clone] [ref]
+
+# The sidestep golden vectors, from sidestep-reference.py.
+python3 scripts/sidestep-vectors.py [path to cyberspace clone] [ref] > test/fixtures/sidestep_v3.json
 ```

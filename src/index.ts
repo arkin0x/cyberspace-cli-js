@@ -4,7 +4,7 @@
  * Consensus-critical primitives for the Cyberspace Protocol v2:
  * - Cantor pairing and SHA-256 hashing
  * - 256-bit interleaved coordinate system
- * - Movement proofs (spatial and 4D temporal)
+ * - Movement proofs (spatial and 4D temporal) and Merkle sidesteps
  * - Terrain-derived temporal height K
  * - Sector partitioning
  * - Location-based encryption key derivation
@@ -18,5 +18,6 @@ export * from './movement.js'
 export * from './terrain.js'
 export * from './sector.js'
 export * from './sidestep.js'
+export * from './grandfathered_v2_sidesteps.js'
 export * from './location_encryption.js'
 export * from './avatar.js'

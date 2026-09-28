@@ -1,5 +1,5 @@
 /**
- * sidestep.ts - Merkle sidestep proofs, version 2 (spec section 6).
+ * sidestep.ts - Merkle sidestep proofs, version 3 (spec section 6).
  *
  * A sidestep crosses an LCA boundary with a Merkle hash tree instead of a
  * Cantor pairing tree. SHA-256 is fixed-size, so there is no storage
@@ -13,15 +13,25 @@
  * one chain position and nobody's published proof shortens anyone else's
  * crossing. With no canonical root left to compare against, the prover also
  * publishes openings (6.10): the destination leaf's path and eight more at
- * positions drawn from the root, which a verifier recomputes from scratch.
- * The seed prefix is exactly one SHA-256 block, so its compression state is
- * taken once per axis and every leaf costs one compression, as before (6.5).
+ * sampled positions, which a verifier recomputes from scratch. The seed
+ * prefix is exactly one SHA-256 block, so its compression state is taken once
+ * per axis and every leaf costs one compression, as before (6.5).
+ *
+ * Version 3 (spec 6.16) puts a price on the samples. Under version 2 they
+ * came from the root, so a prover that built part of a tree could change one
+ * fabricated node and draw fresh samples for about h hashes, until they all
+ * missed the part it skipped. Now they come from G, a hash over a nonce and
+ * the three roots that must fall below 2^256 / A, where A is the crossing's
+ * leaves over eight: a fresh set of samples costs one eighth of the tree, the
+ * smallest price at which skipping work never pays (6.11). The nonce is
+ * published in the `mn` tag.
  *
  * Checked against the spec's sidestep-reference.py golden vectors.
  */
 
 import { cantorPair, intToBytesBE, sha256, sha256FromMidstate, sha256Midstate, hexToBytes, bytesToHex } from './cantor.js'
 import { AXIS_BITS, type Plane } from './coords.js'
+import { GRANDFATHERED_V2_SIDESTEPS } from './grandfathered_v2_sidesteps.js'
 import {
   TEMPORAL_MAX_COMPUTE_HEIGHT,
   alignedBase,
@@ -36,8 +46,10 @@ import { terrainK } from './terrain.js'
 export const SIDESTEP_DOMAIN = new TextEncoder().encode('CYBERSPACE_SIDESTEP_V2')
 /** Nine zero bytes, so the seed prefix fills one 64-byte block exactly (spec 6.4, 6.5). */
 export const SEED_PAD = new Uint8Array(9)
-/** Domain separation for the sampled opening indices (spec 6.10). */
-export const SIDESTEP_SAMPLE_DOMAIN = new TextEncoder().encode('CYBERSPACE_SIDESTEP_SAMPLE_V1')
+/** Domain separation for the re-roll price hash G (spec 6.10). 28 bytes. */
+export const SIDESTEP_GRIND_DOMAIN = new TextEncoder().encode('CYBERSPACE_SIDESTEP_GRIND_V1')
+/** Domain separation for the sampled opening indices, drawn from G (spec 6.10). V1 drew them from the root. */
+export const SIDESTEP_SAMPLE_DOMAIN = new TextEncoder().encode('CYBERSPACE_SIDESTEP_SAMPLE_V2')
 /** Sampled openings per non-trivial axis, after the destination's (spec 6.10). */
 export const SIDESTEP_SAMPLES = 8
 
@@ -62,6 +74,13 @@ const MAX_STREAMING_HEIGHT = 52
  * 4 MB, whatever the height.
  */
 const KEPT_LEVELS = 16
+
+/** The nonce is an unsigned 64-bit integer (spec 6.10). */
+const NONCE_LIMIT = 1n << 64n
+const TWO_256 = 1n << 256n
+/** The nonce's eight bytes sit right after the domain, in G's first block (spec 6.10). */
+const NONCE_AT = SIDESTEP_GRIND_DOMAIN.length
+const HEX64 = /^[0-9a-f]{64}$/
 
 function concatBytes(...parts: Uint8Array[]): Uint8Array {
   const out = new Uint8Array(parts.reduce((n, p) => n + p.length, 0))
@@ -106,31 +125,157 @@ export function merkleParent(left: Uint8Array, right: Uint8Array): Uint8Array {
 
 /**
  * The sampled positions for an axis (spec 6.10): eight indices within the
- * aligned subtree drawn from its root. Collisions stand; the count is fixed.
+ * aligned subtree drawn from G, the re-roll price hash, never from the root.
+ * Collisions stand; the count is fixed.
  */
-export function sampleIndices(root: Uint8Array, axisByte: number, height: number): number[] {
+export function sampleIndices(G: Uint8Array, axisByte: number, height: number): number[] {
   if (height === 0) return []
   const out: number[] = []
   const mod = 1n << BigInt(height)
   for (let i = 0; i < SIDESTEP_SAMPLES; i++) {
     const be32 = new Uint8Array([(i >>> 24) & 0xff, (i >>> 16) & 0xff, (i >>> 8) & 0xff, i & 0xff])
-    const h = sha256(concatBytes(SIDESTEP_SAMPLE_DOMAIN, root, new Uint8Array([axisByte]), be32))
+    const h = sha256(concatBytes(SIDESTEP_SAMPLE_DOMAIN, G, new Uint8Array([axisByte]), be32))
     out.push(Number(bytesToBigInt(h) % mod))
   }
   return out
 }
 
-export interface AxisMerkleResult {
-  /** 32-byte Merkle root over the LCA subtree. */
-  root: Uint8Array
+/**
+ * A, the price in attempts (spec 6.10): the leaves of every axis that moves,
+ * over SIDESTEP_SAMPLES, rounded up, and at least 1. An attempt is three
+ * SHA-256 compressions, one leaf's share of the tree, so the A attempts a
+ * prover makes on average cost one eighth of the crossing.
+ */
+export function sidestepAttempts(heights: readonly number[]): bigint {
+  let leaves = 0n
+  for (const h of heights) if (h > 0) leaves += 1n << BigInt(h)
+  const samples = BigInt(SIDESTEP_SAMPLES)
+  const attempts = (leaves + samples - 1n) / samples
+  return attempts > 1n ? attempts : 1n
+}
+
+function checkNonce(nonce: bigint): void {
+  if (nonce < 0n || nonce >= NONCE_LIMIT) throw new Error('the nonce is an unsigned 64-bit integer')
+}
+
+/** G's 164-byte preimage (spec 6.10), with the nonce's eight bytes left zero for the caller. */
+function grindPreimage(previousEventId: Uint8Array, roots: readonly Uint8Array[]): Uint8Array {
+  if (previousEventId.length !== 32) throw new Error('previous_event_id must be 32 raw bytes')
+  if (roots.length !== 3 || roots.some((r) => r.length !== 32)) throw new Error('G takes the three 32-byte axis roots')
+  return concatBytes(SIDESTEP_GRIND_DOMAIN, new Uint8Array(8), previousEventId, roots[0], roots[1], roots[2])
+}
+
+/**
+ * G = SHA256(SIDESTEP_GRIND_DOMAIN || be64(nonce) || previous_event_id ||
+ * M_x || M_y || M_z) (spec 6.10), with each M the axis root, or for a trivial
+ * axis its single seeded leaf. Three blocks with the nonce in the first, so no
+ * midstate survives from one attempt to the next.
+ */
+export function sidestepGrindHash(previousEventId: Uint8Array, roots: readonly Uint8Array[], nonce: bigint): Uint8Array {
+  checkNonce(nonce)
+  const preimage = grindPreimage(previousEventId, roots)
+  new DataView(preimage.buffer).setBigUint64(NONCE_AT, nonce)
+  return sha256(preimage)
+}
+
+/** The price (spec 6.10): G, read as a 256-bit big-endian integer, times A is below 2^256. */
+export function meetsPrice(G: Uint8Array, attempts: bigint): boolean {
+  if (G.length !== 32) throw new Error('G is 32 bytes')
+  if (attempts < 1n) throw new Error('the price is at least one attempt')
+  return bytesToBigInt(G) * attempts < TWO_256
+}
+
+export interface SidestepNonce {
+  nonce: bigint
+  /** G for that nonce, the source of the sample indices. */
+  G: Uint8Array
+}
+
+export interface NonceSearch {
+  /** The first nonce to try. Default 0, which is what the golden vectors use. */
+  start?: bigint
+  /** One past the last nonce to try. Default 2^64. */
+  end?: bigint
   /**
-   * The openings (spec 6.10): the destination leaf's path first, then the
-   * sampled paths in order, each `height` siblings leaf level first. Empty
-   * for trivial axes.
+   * Called with 1 - e^(-tried / A), the chance a search this long has found a
+   * nonce: about 63% at the expected A attempts, and never stuck at 100% while
+   * the search goes on, as tried / A would be on an unlucky run.
    */
-  openings: Uint8Array[][]
+  onProgress?: ProgressFn
+}
+
+/**
+ * The first nonce from `start` upward and below `end` whose G meets the price
+ * (spec 6.10), or null when that range holds none. Any such nonce verifies,
+ * so a caller can split the search over workers by giving each a disjoint
+ * range and keeping whichever finds one first.
+ */
+export function findSidestepNonce(
+  previousEventId: Uint8Array,
+  roots: readonly Uint8Array[],
+  attempts: bigint,
+  search: NonceSearch = {},
+): SidestepNonce | null {
+  const { start = 0n, end = NONCE_LIMIT, onProgress } = search
+  if (start < 0n || end > NONCE_LIMIT || start > end) throw new Error('the nonce range must lie within 0 .. 2^64')
+  if (attempts < 1n) throw new Error('the price is at least one attempt')
+  const preimage = grindPreimage(previousEventId, roots)
+  const view = new DataView(preimage.buffer)
+  // G × A < 2^256 exactly when G <= floor((2^256 - 1) / A), so each attempt
+  // compares bytes, usually only the first, instead of building a bigint.
+  const threshold = hexToBytes(((TWO_256 - 1n) / attempts).toString(16).padStart(64, '0'))
+  const expected = Number(attempts)
+  const tickEvery = Math.max(1, Math.floor(expected / PROGRESS_TICKS))
+  let tried = 0
+  for (let nonce = start; nonce < end; nonce++) {
+    view.setBigUint64(NONCE_AT, nonce)
+    const G = sha256(preimage)
+    if (notAbove(G, threshold)) {
+      onProgress?.(1)
+      return { nonce, G }
+    }
+    tried++
+    if (onProgress && tried % tickEvery === 0) onProgress(-Math.expm1(-tried / expected))
+  }
+  return null
+}
+
+/** a <= b, for two 32-byte big-endian integers. */
+function notAbove(a: Uint8Array, b: Uint8Array): boolean {
+  for (let i = 0; i < 32; i++) if (a[i] !== b[i]) return a[i] < b[i]
+  return true
+}
+
+/** The `mn` tag's value (spec 8.5): the nonce as exactly 16 lowercase hex characters, big-endian. */
+export function encodeNonce(nonce: bigint): string {
+  checkNonce(nonce)
+  return nonce.toString(16).padStart(16, '0')
+}
+
+/** The nonce in an `mn` tag's value, or null unless it is exactly 16 lowercase hex characters (spec 8.5). */
+export function decodeNonce(hex: string): bigint | null {
+  return /^[0-9a-f]{16}$/.test(hex) ? BigInt('0x' + hex) : null
+}
+
+/**
+ * Whether an event is one of the version 2 sidesteps exempt under spec 6.16,
+ * which carry no `mn` tag and keep their roots and openings unchecked.
+ */
+export function isGrandfatheredV2Sidestep(eventId: string | undefined): boolean {
+  return eventId !== undefined && GRANDFATHERED_V2_SIDESTEPS.has(eventId)
+}
+
+export interface AxisMerkleResult {
+  /** 32-byte Merkle root over the LCA subtree; for a trivial axis, its single seeded leaf. */
+  root: Uint8Array
   /** LCA height of the crossing; 0 when v1 === v2. */
   height: number
+  /**
+   * The openings (spec 6.10), once G is known: the destination leaf's path
+   * first, then the paths at sampleIndices(G, axisByte, height) in order, each
+   * `height` siblings leaf level first. Empty for a trivial axis.
+   */
+  openingsFor(G: Uint8Array): Uint8Array[][]
 }
 
 /**
@@ -173,14 +318,16 @@ function fold(
 
 /**
  * Merkle root for the LCA subtree between two axis values, in streaming
- * memory, plus the openings for the destination leaf and the eight sampled
- * leaves.
+ * memory, and the means to open it at the destination and the eight sampled
+ * leaves once G is known.
  *
- * The sampled positions depend on the root, so they are not known during
- * the pass that produces it. Rather than a second full pass, the top
- * KEPT_LEVELS levels of nodes are kept from the first, and each opening's
- * lower siblings come from rebuilding only the small subtree under that leaf:
- * nine subtrees of 2^(h - 16) leaves, a negligible fraction of the work.
+ * The sampled positions depend on G, which depends on all three roots, so
+ * they are not known during the pass that produces this one. Rather than a
+ * second full pass, the top KEPT_LEVELS levels of nodes are kept from the
+ * first, and each opening's lower siblings come from rebuilding only the
+ * small subtree under that leaf: nine subtrees of 2^(h - 16) leaves, a
+ * negligible fraction of the work. The kept levels live as long as the
+ * result does, 4 MB at most per axis.
  */
 export function computeAxisMerkleRoot(
   prefix: Uint8Array,
@@ -193,7 +340,7 @@ export function computeAxisMerkleRoot(
   const leaf = leafHasher(prefix)
   if (height === 0) {
     onProgress?.(1)
-    return { root: leaf(v1), openings: [], height: 0 }
+    return { root: leaf(v1), height: 0, openingsFor: () => [] }
   }
   if (height > MAX_STREAMING_HEIGHT) {
     throw new Error(`LCA height ${height} exceeds streaming index range (2^53 leaves)`)
@@ -202,11 +349,13 @@ export function computeAxisMerkleRoot(
   const base = alignedBase(v1, height)
   const leafCount = 2 ** height
   const keepFrom = Math.max(0, height - KEPT_LEVELS)
-  const kept: Uint8Array[][] = []
-  for (let level = 0; level <= height; level++) kept.push(level >= keepFrom ? new Array(2 ** (height - level)) : [])
+  // One packed buffer per kept level, 32 bytes per node, rather than an
+  // object per node: three axes' worth now stay alive through the nonce search.
+  const kept: Uint8Array[] = []
+  for (let level = 0; level <= height; level++) kept.push(new Uint8Array(level >= keepFrom ? 32 * 2 ** (height - level) : 0))
   const tickEvery = Math.max(1, Math.floor(leafCount / PROGRESS_TICKS))
 
-  const root = fold(leaf, base, 0, height, keepFrom, (level, index, hash) => { kept[level][index] = hash }, (i) => {
+  const root = fold(leaf, base, 0, height, keepFrom, (level, index, hash) => kept[level].set(hash, 32 * index), (i) => {
     if (onProgress && (i + 1) % tickEvery === 0) onProgress((i + 1) / leafCount)
   })
 
@@ -226,16 +375,20 @@ export function computeAxisMerkleRoot(
       }
     }
     for (let level = keepFrom; level < height; level++) {
-      siblings[level] = kept[level][Math.floor(index / 2 ** level) ^ 1]
+      const at = 32 * (Math.floor(index / 2 ** level) ^ 1)
+      siblings[level] = kept[level].slice(at, at + 32)
     }
-    if (siblings.some((s) => s === undefined)) throw new Error('incomplete opening')
+    for (let level = 0; level < height; level++) if (!siblings[level]) throw new Error('incomplete opening')
     return siblings
   }
 
   const destIndex = Number(v2 - base)
-  const openings = [pathFor(destIndex), ...sampleIndices(root, axisByte, height).map(pathFor)]
   onProgress?.(1)
-  return { root, openings, height }
+  return {
+    root,
+    height,
+    openingsFor: (G) => [pathFor(destIndex), ...sampleIndices(G, axisByte, height).map(pathFor)],
+  }
 }
 
 /**
@@ -267,8 +420,10 @@ export function verifyMerkleInclusion(
 }
 
 /**
- * Level 1 for one axis (spec 6.11, 8.7.2 step 4): the destination's path,
- * then each sampled leaf recomputed from the seed and carried to the root.
+ * Level 1 for one axis (spec 6.11, 8.7.2 step 5): the destination's path,
+ * then each leaf sampled from G recomputed from the seed and carried to the
+ * root. G is the caller's to derive and price-check (sidestepGrindHash,
+ * meetsPrice); this checks the paths only.
  */
 export function verifyAxisOpenings(
   prefix: Uint8Array,
@@ -277,6 +432,7 @@ export function verifyAxisOpenings(
   v2: bigint,
   root: Uint8Array,
   openings: Uint8Array[][],
+  G: Uint8Array,
 ): boolean {
   const height = findLcaHeight(v1, v2)
   if (height === 0) return openings.length === 0 && bytesToHex(merkleLeaf(prefix, v1)) === bytesToHex(root)
@@ -284,7 +440,7 @@ export function verifyAxisOpenings(
   if (openings.some((p) => p.length !== height)) return false
   const base = alignedBase(v1, height)
   if (!verifyMerkleInclusion(prefix, v2, openings[0], root, height, base)) return false
-  const samples = sampleIndices(root, axisByte, height)
+  const samples = sampleIndices(G, axisByte, height)
   for (let i = 0; i < SIDESTEP_SAMPLES; i++) {
     if (!verifyMerkleInclusion(prefix, base + BigInt(samples[i]), openings[i + 1], root, height, base)) return false
   }
@@ -325,8 +481,14 @@ export interface SidestepCostEstimate {
   lcaY: number
   lcaZ: number
   maxHeight: number
-  /** Total SHA-256 evaluations across all three axes (leaves + internals). */
+  /** Total SHA-256 evaluations across all three axes (leaves + internals): the trees alone. */
   totalHashes: number
+  /**
+   * A, the expected attempts at the re-roll price (spec 6.10), not in
+   * totalHashes. Each is three compressions against a tree hash's one and a
+   * half on average, so they weigh 2 × attempts hashes: one eighth more work.
+   */
+  attempts: number
 }
 
 /** SHA-256 evaluations to build one axis tree: 2^h leaves + 2^h - 1 internals. */
@@ -352,6 +514,7 @@ export function estimateSidestepCost(
     lcaZ,
     maxHeight: Math.max(lcaX, lcaY, lcaZ),
     totalHashes: axisHashCount(lcaX) + axisHashCount(lcaY) + axisHashCount(lcaZ),
+    attempts: Number(sidestepAttempts([lcaX, lcaY, lcaZ])),
   }
 }
 
@@ -396,6 +559,10 @@ export interface SidestepProof {
   /** double-SHA256(sidestep_n), lowercase hex. */
   proofHash: string
   lcaHeights: [number, number, number]
+  /** The re-roll nonce (spec 6.10); the `mn` tag is encodeNonce(nonce). */
+  nonce: bigint
+  /** G for that nonce, which the sample indices were drawn from. */
+  G: Uint8Array
   /** Per-axis openings (spec 6.10): destination path first, then the samples. */
   openings: { x: Uint8Array[][]; y: Uint8Array[][]; z: Uint8Array[][] }
 }
@@ -409,9 +576,12 @@ function temporal(previousEventIdHex: string, K: number, onProgress?: ProgressFn
 }
 
 /**
- * Compute a full sidestep proof: per-axis seeded Merkle roots and openings,
- * combined into region_m, plus the temporal Cantor binding identical to hop
- * proofs (spec 6.4 - 6.10).
+ * Compute a full sidestep proof: per-axis seeded Merkle roots, the re-roll
+ * nonce, and the openings sampled from its G, with the roots combined into
+ * region_m, plus the temporal Cantor binding identical to hop proofs (spec
+ * 6.4 - 6.10). The nonce is the first meeting the price searching upward
+ * from 0 on this thread, as in the golden vectors. The search is one eighth
+ * of the tree's work, and the tree itself runs on this thread too.
  */
 export function computeSidestepProof(
   x1: bigint, y1: bigint, z1: bigint,
@@ -424,12 +594,14 @@ export function computeSidestepProof(
   const prevId = hexToBytes(previousEventIdHex)
 
   // Weight each stage's progress by its share of the hash work, mirroring
-  // computeHopProof, so the reported fraction tracks elapsed cost.
+  // computeHopProof, so the reported fraction tracks elapsed cost. An attempt
+  // at the price is three compressions against a tree hash's one and a half.
   const hx = findLcaHeight(x1, x2)
   const hy = findLcaHeight(y1, y2)
   const hz = findLcaHeight(z1, z2)
+  const attempts = sidestepAttempts([hx, hy, hz])
   const tk = terrainK(x2, y2, z2, plane)
-  const work = [axisHashCount(hx), axisHashCount(hy), axisHashCount(hz), subtreeLeafCount(tk)]
+  const work = [axisHashCount(hx), axisHashCount(hy), axisHashCount(hz), 2 * Number(attempts), subtreeLeafCount(tk)]
   const totalWork = work.reduce((a, b) => a + b, 0)
 
   let baseFraction = 0
@@ -445,11 +617,18 @@ export function computeSidestepProof(
   const ay = computeAxisMerkleRoot(seedPrefix(prevId, AXIS_BYTE.y), AXIS_BYTE.y, y1, y2, stage(1))
   const az = computeAxisMerkleRoot(seedPrefix(prevId, AXIS_BYTE.z), AXIS_BYTE.z, z1, z2, stage(2))
 
+  // The samples come from G, and G from all three roots and the nonce, so the
+  // openings are taken last (spec 6.10).
+  const found = findSidestepNonce(prevId, [ax.root, ay.root, az.root], attempts, { onProgress: stage(3) })
+  if (!found) throw new Error('no 64-bit nonce meets the price')
+  const { nonce, G } = found
+  const openings = { x: ax.openingsFor(G), y: ay.openingsFor(G), z: az.openingsFor(G) }
+
   const regionM = cantorPair(
     cantorPair(bytesToBigInt(ax.root), bytesToBigInt(ay.root)),
     bytesToBigInt(az.root),
   )
-  const { t, cantorT } = temporal(previousEventIdHex, tk, stage(3))
+  const { t, cantorT } = temporal(previousEventIdHex, tk, stage(4))
   const sidestepN = cantorPair(regionM, cantorT)
 
   // Proof hash (spec 6.8): double SHA-256.
@@ -467,7 +646,9 @@ export function computeSidestepProof(
     sidestepN,
     proofHash,
     lcaHeights: [ax.height, ay.height, az.height],
-    openings: { x: ax.openings, y: ay.openings, z: az.openings },
+    nonce,
+    G,
+    openings,
   }
 }
 
@@ -480,6 +661,13 @@ export interface SidestepClaim {
   merkleRoots: [string, string, string]
   /** The `mp` tag's three segments. */
   openings: [string, string, string]
+  /** The `mn` tag's value, or null when the event has no `mn` tag (a version 2 proof, spec 6.16). */
+  nonce: string | null
+  /**
+   * The event's id. Consulted only when `nonce` is null: a version 2 sidestep
+   * stands only if its id is in GRANDFATHERED_V2_SIDESTEPS.
+   */
+  eventId?: string
   /** The `hx`, `hy`, `hz` tags. */
   lcaHeights: [number, number, number]
   proofHash: string
@@ -487,32 +675,63 @@ export interface SidestepClaim {
 
 /**
  * Level 1 verification of a sidestep event (spec 8.7.2), everything a
- * verifier can check in seconds: geometry, heights, each axis's openings
- * against the seeded leaves, and the proof hash rebuilt from the roots and
- * the temporal root. Returns the names of what failed; empty means valid. A
- * v1 event fails on its openings, as spec 6.15 requires.
+ * verifier can check in seconds: geometry, heights, the re-roll price, each
+ * axis's openings against the seeded leaves at the positions G draws, and
+ * the proof hash rebuilt from the roots and the temporal root. Returns the
+ * names of what failed; empty means valid.
+ *
+ * A v1 event fails on its openings (spec 6.15). An event without a nonce is
+ * version 2 and fails on `mn` (6.16) unless its id is listed, in which case
+ * its roots and openings are accepted unchecked and everything else is
+ * checked as usual. A version 2 proof given some nonce still fails, because
+ * its samples were drawn from the roots rather than from G.
  */
 export function verifySidestepLevel1(claim: SidestepClaim): string[] {
   const failed: string[] = []
-  if (claim.previousEventIdHex.length !== 64 || !/^[0-9a-f]+$/.test(claim.previousEventIdHex)) return ['previous_event_id']
+  if (!HEX64.test(claim.previousEventIdHex)) return ['previous_event_id']
   const prevId = hexToBytes(claim.previousEventIdHex)
+  // Undefined as well as null, for a caller that passes a missing tag straight through.
+  const absent = claim.nonce === null || claim.nonce === undefined
+  const exempt = absent && isGrandfatheredV2Sidestep(claim.eventId)
+  const nonce = absent ? null : decodeNonce(claim.nonce!)
+  if (nonce === null && !exempt) failed.push('mn')
+
   const axes: AxisName[] = ['x', 'y', 'z']
-  const roots: bigint[] = []
+  const heights: number[] = []
+  const roots: Array<Uint8Array | null> = []
   axes.forEach((axis, i) => {
     const v1 = claim.from[axis], v2 = claim.to[axis]
     const h = findLcaHeight(v1, v2)
+    heights.push(h)
     if (claim.lcaHeights[i] !== h) failed.push(`h${axis}`)
     if (!validCrossing(v1, v2)) failed.push(`geometry:${axis}`)
     const rootHex = claim.merkleRoots[i]
-    if (!/^[0-9a-f]{64}$/.test(rootHex)) { failed.push(`mr:${axis}`); roots.push(0n); return }
-    const root = hexToBytes(rootHex)
-    roots.push(bytesToBigInt(root))
-    const openings = decodeOpenings(claim.openings[i], h)
-    if (!openings) { failed.push(`mp:${axis}`); return }
-    if (!verifyAxisOpenings(seedPrefix(prevId, AXIS_BYTE[axis]), AXIS_BYTE[axis], v1, v2, root, openings)) failed.push(`openings:${axis}`)
+    if (!HEX64.test(rootHex)) { failed.push(`mr:${axis}`); roots.push(null); return }
+    roots.push(hexToBytes(rootHex))
   })
+
+  if (!exempt) {
+    // Step 4: G from the claimed roots and nonce, then its price.
+    let G: Uint8Array | null = null
+    if (nonce !== null && roots.every((r) => r !== null)) {
+      G = sidestepGrindHash(prevId, roots as Uint8Array[], nonce)
+      if (!meetsPrice(G, sidestepAttempts(heights))) failed.push('price')
+    }
+    // Step 5: the destination path and the paths at the positions G draws.
+    axes.forEach((axis, i) => {
+      const openings = decodeOpenings(claim.openings[i], heights[i])
+      if (!openings) { failed.push(`mp:${axis}`); return }
+      const root = roots[i]
+      if (G === null || root === null) return
+      if (!verifyAxisOpenings(seedPrefix(prevId, AXIS_BYTE[axis]), AXIS_BYTE[axis], claim.from[axis], claim.to[axis], root, openings, G)) {
+        failed.push(`openings:${axis}`)
+      }
+    })
+  }
   if (failed.length) return failed
-  const regionM = cantorPair(cantorPair(roots[0], roots[1]), roots[2])
+
+  const [mx, my, mz] = roots.map((r) => bytesToBigInt(r!))
+  const regionM = cantorPair(cantorPair(mx, my), mz)
   const K = terrainK(claim.to.x, claim.to.y, claim.to.z, claim.plane)
   const { cantorT } = temporal(claim.previousEventIdHex, K)
   const proofHash = bytesToHex(sha256(sha256(intToBytesBE(cantorPair(regionM, cantorT)))))
